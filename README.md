@@ -50,9 +50,11 @@ For a qualifying out-of-range position:
 **Prerequisites:** Node.js >= 18, ETH on Base for gas.
 
 ```bash
+git clone https://github.com/bilalkhan360/lp_bot.git
+cd lp_bot
 npm install
 cp .env.example .env
-# fill in .env, then:
+# fill in private key and RPC in .env, then:
 npm start
 ```
 
@@ -75,7 +77,7 @@ Runtime controls:
 
 ```env
 CHECK_INTERVAL=30000
-AUTO_REBALANCE=false
+AUTO_REBALANCE=true
 REBALANCE_THRESHOLD=20
 RANGE_MULTIPLIER=2.6
 SLIPPAGE_BPS=300
@@ -88,8 +90,8 @@ Kyber swap:
 ```env
 KYBER_API_BASE_URL=https://aggregator-api.kyberswap.com
 KYBER_CHAIN=base
-KYBER_CLIENT_ID=lp_bot
-KYBER_SOURCE=lp_bot
+KYBER_CLIENT_ID=lp_rebalancer
+KYBER_SOURCE=lp_rebalancer
 KYBER_INCLUDED_SOURCES=
 KYBER_ALLOWED_ROUTERS=
 ```
