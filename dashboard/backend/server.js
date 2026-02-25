@@ -182,6 +182,49 @@ app.get('/api/swaps', (req, res) => {
   });
 });
 
+// Position value snapshots + P&L
+app.get('/api/position-value', (req, res) => {
+  const { limit = 500 } = req.query;
+
+  const allSnapshots = db.prepare(`
+    SELECT * FROM position_value_snapshots
+    ORDER BY timestamp ASC
+  `).all();
+
+  // Sample: keep 1 row per 600s (10 min) window, plus always keep first and last
+  const sampled = [];
+  let lastKept = 0;
+  for (let i = 0; i < allSnapshots.length; i++) {
+    const row = allSnapshots[i];
+    if (i === 0 || i === allSnapshots.length - 1 || row.timestamp - lastKept >= 600) {
+      sampled.push(row);
+      lastKept = row.timestamp;
+    }
+  }
+
+  const snapshots = sampled.length > parseInt(limit)
+    ? sampled.slice(sampled.length - parseInt(limit))
+    : sampled;
+
+  const firstSnapshot = allSnapshots.length > 0 ? allSnapshots[0] : null;
+  const lastSnapshot = allSnapshots.length > 0 ? allSnapshots[allSnapshots.length - 1] : null;
+  const currentValue = lastSnapshot?.total_value_usd || 0;
+  const firstValue = firstSnapshot?.total_value_usd || 0;
+  const pnl = currentValue - firstValue;
+  const pnlPercent = firstValue > 0 ? (pnl / firstValue) * 100 : 0;
+
+  res.json({
+    snapshots,
+    pnl: {
+      currentValue,
+      firstValue,
+      pnl,
+      pnlPercent,
+      trackingSince: firstSnapshot?.timestamp || null,
+    },
+  });
+});
+
 // Aggregate summary for overview cards
 app.get('/api/summary', (req, res) => {
   const latestTs = db.prepare(

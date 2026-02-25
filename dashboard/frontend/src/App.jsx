@@ -5,7 +5,8 @@ import Overview  from './components/pages/Overview.jsx';
 import Positions from './components/pages/Positions.jsx';
 import Rewards   from './components/pages/Rewards.jsx';
 import Costs     from './components/pages/Costs.jsx';
-import Swaps     from './components/pages/Swaps.jsx';
+import Swaps          from './components/pages/Swaps.jsx';
+import PositionValue  from './components/pages/PositionValue.jsx';
 import { useWebSocket } from './hooks/useWebSocket.jsx';
 
 export const DashboardCtx = createContext({});
@@ -37,6 +38,7 @@ export default function App() {
             <Route path="rewards"   element={<Rewards />} />
             <Route path="costs"     element={<Costs />} />
             <Route path="swaps"     element={<Swaps />} />
+            <Route path="value"     element={<PositionValue />} />
           </Route>
         </Routes>
       </BrowserRouter>

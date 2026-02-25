@@ -65,24 +65,71 @@ const SUPPORTED_SWAP_TOKENS = new Set([
   '0x311935cd80b76769bf2ecc9d8ab7635b2139cf82', // SOL on Base
 ]);
 
+// Binance symbols for tokens we can price via SOLUSDT / ETHUSDT
+const BINANCE_SYMBOLS = new Map([
+  ['SOL', 'SOLUSDT'],
+  ['ETH', 'ETHUSDT'],
+  ['WETH', 'ETHUSDT'],
+]);
+
 /**
- * Fetch the USD price of a token at a specific Unix timestamp via Alchemy's
- * historical token prices endpoint.
- *
- * Uses 5-minute candles which is the finest resolution available.
- * Caches results in price_cache so repeated lookups for the same swap are free.
+ * Fetch historical price from Binance using 1-second klines.
+ * No API key needed. Extremely precise — 1s candle containing the swap block.
+ */
+async function fetchBinancePrice(symbol, timestamp) {
+  const pair  = BINANCE_SYMBOLS.get(symbol);
+  if (!pair) return 0;
+
+  // Check DB cache within ±30s (tight window for 1s precision)
+  const cached = db.prepare(
+    'SELECT price_usd FROM price_cache WHERE symbol = ? AND timestamp BETWEEN ? AND ? ORDER BY ABS(timestamp - ?) LIMIT 1'
+  ).get(symbol, timestamp - 30, timestamp + 30, timestamp);
+  if (cached?.price_usd) return cached.price_usd;
+
+  const tsMs = timestamp * 1000;
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pair}&interval=1s&startTime=${tsMs}&limit=1`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    const data = await res.json();
+    if (!Array.isArray(data) || !data[0]) return 0;
+
+    // Kline format: [openTime, open, high, low, close, ...]
+    const closePrice = parseFloat(data[0][4]);
+    if (!closePrice) return 0;
+
+    db.prepare('INSERT OR IGNORE INTO price_cache (timestamp, symbol, price_usd) VALUES (?, ?, ?)')
+      .run(timestamp, symbol, closePrice);
+
+    console.log(`[TxHistory] Binance 1s price: ${pair} @ ${new Date(tsMs).toISOString()} = $${closePrice.toFixed(4)}`);
+    return closePrice;
+  } catch (e) {
+    console.warn(`[TxHistory] Binance price failed (${pair} @ ${new Date(tsMs).toISOString()}):`, e.message);
+    return 0;
+  }
+}
+
+/**
+ * Fetch historical price for a token at a specific Unix timestamp.
+ * - SOL/ETH: Binance 1-second klines (most precise, no API key)
+ * - Other tokens (AERO): Alchemy 5-minute candles as fallback
  */
 async function fetchHistoricalPrice(symbol, timestamp) {
   if (symbol === 'USDC') return 1.0;
+
+  // Use Binance 1s candles for SOL and ETH
+  if (BINANCE_SYMBOLS.has(symbol)) {
+    const price = await fetchBinancePrice(symbol, timestamp);
+    if (price > 0) return price;
+  }
+
+  // Fallback: Alchemy 5-minute candles (for AERO and others)
   if (!ALCHEMY_API_KEY) return 0;
 
-  // Check DB cache within ±30 min of the requested timestamp
   const cached = db.prepare(
     'SELECT price_usd FROM price_cache WHERE symbol = ? AND timestamp BETWEEN ? AND ? ORDER BY ABS(timestamp - ?) LIMIT 1'
   ).get(symbol, timestamp - 1800, timestamp + 1800, timestamp);
   if (cached?.price_usd) return cached.price_usd;
 
-  // ±1 hour window around the swap to guarantee we get candles
   const startTime = new Date((timestamp - 3600) * 1000).toISOString();
   const endTime   = new Date((timestamp + 3600) * 1000).toISOString();
 
@@ -97,10 +144,9 @@ async function fetchHistoricalPrice(symbol, timestamp) {
       }
     );
     const json = await res.json();
-    const pts  = json?.data; // [{ value: "123.45", timestamp: "2024-..." }, ...]
+    const pts  = json?.data;
     if (!pts?.length) return 0;
 
-    // Find the candle closest to the swap timestamp
     let bestPrice = Number(pts[0].value), minDiff = Infinity;
     for (const pt of pts) {
       const ptTs = Math.floor(new Date(pt.timestamp).getTime() / 1000);
@@ -108,17 +154,13 @@ async function fetchHistoricalPrice(symbol, timestamp) {
       if (diff < minDiff) { minDiff = diff; bestPrice = Number(pt.value); }
     }
 
-    // Cache at the requested timestamp so future lookups hit within ±30 min
     db.prepare('INSERT OR IGNORE INTO price_cache (timestamp, symbol, price_usd) VALUES (?, ?, ?)')
       .run(timestamp, symbol, bestPrice);
 
-    console.log(
-      `[TxHistory] Alchemy price: ${symbol} @ ${new Date(timestamp * 1000).toISOString()}` +
-      ` = $${bestPrice.toFixed(4)} (closest candle ${Math.round(minDiff / 60)}min away)`
-    );
+    console.log(`[TxHistory] Alchemy price: ${symbol} @ ${new Date(timestamp * 1000).toISOString()} = $${bestPrice.toFixed(4)}`);
     return bestPrice;
   } catch (e) {
-    console.warn(`[TxHistory] Alchemy price failed (${symbol} @ ${new Date(timestamp * 1000).toISOString()}):`, e.message);
+    console.warn(`[TxHistory] Alchemy price failed (${symbol}):`, e.message);
     return 0;
   }
 }

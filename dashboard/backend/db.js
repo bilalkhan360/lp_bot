@@ -89,6 +89,28 @@ db.exec(`
     block_number     INTEGER
   );
 
+  CREATE TABLE IF NOT EXISTS position_value_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    token_id TEXT NOT NULL,
+    sol_amount REAL DEFAULT 0,
+    usdc_amount REAL DEFAULT 0,
+    sol_price REAL DEFAULT 0,
+    fees_usd REAL DEFAULT 0,
+    total_value_usd REAL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS lp_deposits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    tx_hash TEXT UNIQUE NOT NULL,
+    amount REAL NOT NULL,
+    token TEXT NOT NULL,
+    amount_usd REAL DEFAULT 0,
+    from_address TEXT,
+    block_number INTEGER
+  );
+
   CREATE INDEX IF NOT EXISTS idx_swaps_timestamp ON swap_transactions(timestamp);
 
   CREATE INDEX IF NOT EXISTS idx_pos_timestamp ON position_snapshots(timestamp);
@@ -97,6 +119,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_gas_timestamp ON gas_transactions(timestamp);
   CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_cache(timestamp);
   CREATE INDEX IF NOT EXISTS idx_claims_timestamp ON reward_claims(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pv_timestamp ON position_value_snapshots(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pv_token_id ON position_value_snapshots(token_id);
+  CREATE INDEX IF NOT EXISTS idx_deposits_timestamp ON lp_deposits(timestamp);
 `);
 
 export default db;

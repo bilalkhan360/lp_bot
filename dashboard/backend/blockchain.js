@@ -227,23 +227,23 @@ async function findPool(token0, token1) {
   return null;
 }
 
-// ── Current tick from pool ────────────────────────────────────────────────────
+// ── Current pool state (tick + sqrtPriceX96) ─────────────────────────────────
 
-async function getCurrentTick(poolAddress) {
+async function getPoolState(poolAddress) {
   try {
     const slot0 = await client.readContract({
       address: poolAddress,
       abi: POOL_ABI,
       functionName: 'slot0',
     });
-    // slot0 returned as positional tuple — slot0[1] is tick (same as bot's slot0.tick)
-    const tick = slot0.tick ?? slot0[1];
+    const tick         = slot0.tick         ?? slot0[1];
+    const sqrtPriceX96 = slot0.sqrtPriceX96 ?? slot0[0];
     const tickNum = tick !== undefined ? Number(tick) : null;
     console.log(`[blockchain] Pool ${poolAddress.slice(0, 10)}… currentTick: ${tickNum}`);
-    return tickNum;
+    return { tick: tickNum, sqrtPriceX96: sqrtPriceX96 ?? null };
   } catch (e) {
     console.warn(`[blockchain] slot0 error for ${poolAddress}:`, e.message);
-    return null;
+    return { tick: null, sqrtPriceX96: null };
   }
 }
 
@@ -293,7 +293,9 @@ async function buildPosition(tokenId, pos, isStaked, gaugeAddress, gaugePoolAddr
     poolAddress = await findPool(token0, token1);
   }
 
-  const currentTick = poolAddress ? await getCurrentTick(poolAddress) : null;
+  const poolState   = poolAddress ? await getPoolState(poolAddress) : { tick: null, sqrtPriceX96: null };
+  const currentTick = poolState.tick;
+  const sqrtPriceX96 = poolState.sqrtPriceX96;
   const tickLower   = Number(tickLower_r);
   const tickUpper   = Number(tickUpper_r);
   const isInRange   = currentTick !== null
@@ -316,6 +318,7 @@ async function buildPosition(tokenId, pos, isStaked, gaugeAddress, gaugePoolAddr
     tokensOwed0:    formatUnits(tokensOwed0 ?? 0n, token0Info.decimals),
     tokensOwed1:    formatUnits(tokensOwed1 ?? 0n, token1Info.decimals),
     currentTick,
+    sqrtPriceX96:   sqrtPriceX96 ? sqrtPriceX96.toString() : null,
     isInRange,
     poolAddress,
     isStaked,
@@ -496,6 +499,64 @@ async function getGaugeRewards(walletAddress, positions, prices) {
   return rewards;
 }
 
+// ── V3 math: compute token amounts from liquidity + tick range ─────────────
+
+function tickToSqrtPriceX96(tick) {
+  // sqrtPrice = 1.0001^(tick/2) * 2^96
+  return Math.pow(1.0001, tick / 2) * (2 ** 96);
+}
+
+export function computePositionValue(position, prices) {
+  const { liquidity, tickLower, tickUpper, currentTick, sqrtPriceX96,
+          token0Decimals, token1Decimals, tokensOwed0, tokensOwed1 } = position;
+
+  if (!liquidity || liquidity === '0' || currentTick === null || currentTick === undefined) {
+    return null;
+  }
+
+  const dec0 = token0Decimals || 9;  // SOL
+  const dec1 = token1Decimals || 6;  // USDC
+
+  // Derive SOL price directly from pool's sqrtPriceX96 (exact on-chain price, no CoinGecko lag)
+  // price (token1/token0 in raw units) = (sqrtPriceX96 / 2^96)^2
+  // human price = raw_price * 10^(dec0 - dec1)
+  let solPrice = prices?.SOL || 0;
+  if (sqrtPriceX96) {
+    const sqrtP = Number(BigInt(sqrtPriceX96)) / (2 ** 96);
+    solPrice = sqrtP * sqrtP * Math.pow(10, dec0 - dec1);
+  }
+
+  const L = Number(liquidity);
+  const sqrtLower   = Math.pow(1.0001, tickLower  / 2);
+  const sqrtUpper   = Math.pow(1.0001, tickUpper  / 2);
+  const sqrtCurrent = Math.pow(1.0001, currentTick / 2);
+
+  let amount0 = 0; // token0 (SOL)
+  let amount1 = 0; // token1 (USDC)
+
+  if (currentTick < tickLower) {
+    amount0 = L * (1 / sqrtLower - 1 / sqrtUpper);
+  } else if (currentTick >= tickUpper) {
+    amount1 = L * (sqrtUpper - sqrtLower);
+  } else {
+    amount0 = L * (1 / sqrtCurrent - 1 / sqrtUpper);
+    amount1 = L * (sqrtCurrent - sqrtLower);
+  }
+
+  const solAmount  = amount0 / (10 ** dec0);
+  const usdcAmount = amount1 / (10 ** dec1);
+
+  const feeSol  = parseFloat(tokensOwed0 || '0');
+  const feeUsdc = parseFloat(tokensOwed1 || '0');
+
+  const totalSol   = solAmount  + feeSol;
+  const totalUsdc  = usdcAmount + feeUsdc;
+  const feesUsd    = feeSol * solPrice + feeUsdc;
+  const totalValueUsd = totalSol * solPrice + totalUsdc;
+
+  return { solAmount: totalSol, usdcAmount: totalUsdc, solPrice, feesUsd, totalValueUsd };
+}
+
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 export async function fetchAllMetrics() {
@@ -534,6 +595,23 @@ export async function fetchAllMetrics() {
     );
   }
 
+  // ── Store position value snapshots ────────────────────────────────────────
+  const insertValue = db.prepare(`
+    INSERT INTO position_value_snapshots
+      (timestamp, token_id, sol_amount, usdc_amount, sol_price, fees_usd, total_value_usd)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const positionValues = [];
+  for (const pos of allPositions) {
+    const val = computePositionValue(pos, prices);
+    if (val) {
+      insertValue.run(timestamp, pos.tokenId, val.solAmount, val.usdcAmount, val.solPrice, val.feesUsd, val.totalValueUsd);
+      positionValues.push({ tokenId: pos.tokenId, ...val });
+      console.log(`[blockchain] Position #${pos.tokenId} value: $${val.totalValueUsd.toFixed(2)} (${val.solAmount.toFixed(4)} SOL + ${val.usdcAmount.toFixed(2)} USDC)`);
+    }
+  }
+
   // earned() requires knowing which tokenIds are staked — pass positions list
   const rewards = await getGaugeRewards(WALLET_ADDRESS, allPositions, prices);
 
@@ -545,5 +623,5 @@ export async function fetchAllMetrics() {
     insertReward.run(timestamp, r.gaugeAddress, r.earnedAmount, r.earnedUsd, r.aeroPrice);
   }
 
-  return { timestamp, positions: allPositions, rewards, prices, walletAddress: WALLET_ADDRESS };
+  return { timestamp, positions: allPositions, rewards, prices, positionValues, walletAddress: WALLET_ADDRESS };
 }
