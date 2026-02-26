@@ -27,42 +27,32 @@ module.exports = {
   // Monitored positions (format: poolAddress:token0:token1:feeTier)
   monitoredPositions: (process.env.MONITORED_POSITIONS || '').split(',').filter(p => p.trim() !== ''),
 
-  // Kyber Aggregator configuration (used for token swaps)
-  kyber: {
-    apiBaseUrl: process.env.KYBER_API_BASE_URL || 'https://aggregator-api.kyberswap.com',
-    chain: process.env.KYBER_CHAIN || 'base',
-    clientId: process.env.KYBER_CLIENT_ID || 'lp_bot',
-    source: process.env.KYBER_SOURCE || 'lp_bot',
-    // Empty string allows all supported sources (best route).
-    includedSources: process.env.KYBER_INCLUDED_SOURCES || '',
-    // Optional router allowlist (comma separated). Empty disables allowlist check.
-    allowedRouters: (process.env.KYBER_ALLOWED_ROUTERS || '')
-      .split(',')
-      .map((v) => v.trim())
-      .filter(Boolean)
-  },
-  
   // ============================================================
   // AERODROME CONTRACTS - Base Mainnet
-  // 
+  //
   // IMPORTANT: Verify these addresses at:
   // https://docs.aerodrome.finance/contracts
-  // 
+  //
   // These can be overridden via environment variables:
   // - AERODROME_POSITION_MANAGER
-  // - AERODROME_ROUTER
+  // - AERODROME_UNIVERSAL_ROUTER
   // - AERODROME_FACTORY
+  // - AERODROME_QUOTER
   // ============================================================
   aerodrome: {
     // NonfungiblePositionManager - handles V3 LP positions (VERIFIED)
     positionManager: process.env.AERODROME_POSITION_MANAGER || '0x827922686190790b37229fd06084350E74485b72',
-    
+
     // Alternative PositionManager for specific pools (USER SPECIFIED)
     altPositionManager: process.env.AERODROME_ALT_POSITION_MANAGER || '0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F',
-    
-    // Router - legacy setting (current swap execution uses Kyber router from API response)
-    router: process.env.AERODROME_ROUTER || '0x6Df1c91424F79E40E33B1A48F0687B666bE71075',
-    
+
+    // Universal Router - used for all token swaps (VERIFIED on Base)
+    // Supports CL (V3-style) and V2 AMM pools via execute(commands, inputs, deadline)
+    universalRouter: process.env.AERODROME_UNIVERSAL_ROUTER || '0x6Df1c91424F79E40E33B1A48F0687B666bE71075',
+
+    // SlipStream Quoter - used to get on-chain price quotes before swapping (VERIFIED on Base)
+    quoter: process.env.AERODROME_QUOTER || '0x3d4C22254F86f64B7eC90ab8F7aeC1FBFD271c6C',
+
     // Factory - for finding pools (USER SPECIFIED)
     factory: process.env.AERODROME_FACTORY || '0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a',
   },

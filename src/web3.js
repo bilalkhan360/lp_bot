@@ -35,15 +35,6 @@ const POOL_ABI = [
   'function tick() view returns (int24)',
 ];
 
-// Router ABI for exact input swaps
-const ROUTER_ABI = [
-  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)',
-  'function exactInput((bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum)) payable returns (uint256 amountOut)',
-  'function factory() view returns (address)',
-  'function multicall(bytes[] data) payable returns (bytes[] results)',
-  'function refundETH() payable',
-  'function unwrapWETH9(uint256 amountMinimum, address recipient) payable',
-];
 
 class Web3Manager {
   constructor() {
@@ -51,7 +42,6 @@ class Web3Manager {
     this.eoaWallet = null;
     this.wallet = null;
     this.positionManager = null;
-    this.router = null;
     this.pools = new Map();
     this.tokens = new Map();
   }
@@ -75,12 +65,6 @@ class Web3Manager {
     this.positionManager = new Contract(
       config.aerodrome.positionManager,
       POSITION_MANAGER_ABI,
-      this.wallet
-    );
-    
-    this.router = new Contract(
-      config.aerodrome.router,
-      ROUTER_ABI,
       this.wallet
     );
     

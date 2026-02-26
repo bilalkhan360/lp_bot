@@ -1,6 +1,4 @@
 const { ethers, Contract } = require('ethers');
-const http = require('http');
-const https = require('https');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -484,162 +482,16 @@ class Rebalancer {
     }
   }
 
-  getKyberHeaders() {
-    const headers = {};
-    if (config.kyber.clientId) {
-      headers['x-client-id'] = config.kyber.clientId;
-    }
-    return headers;
-  }
-
-  getKyberApiUrl(path) {
-    const base = config.kyber.apiBaseUrl.replace(/\/+$/, '');
-    return `${base}/${config.kyber.chain}/api/v1/${path}`;
-  }
-
-  parseJsonResponse(text, contextLabel) {
-    if (typeof text === 'string' && text.includes('Just a moment')) {
-      throw new Error(`${contextLabel} blocked by Cloudflare challenge page`);
-    }
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      throw new Error(`${contextLabel} returned non-JSON response: ${text.slice(0, 500)}`);
-    }
-  }
-
-  async httpRequest(url, options = {}) {
-    const { method = 'GET', headers = {}, body = null, timeoutMs = 15000 } = options;
-    const requestHeaders = {
-      Accept: 'application/json',
-      'User-Agent': 'lp-bot/1.0',
-      ...headers
-    };
-
-    return await new Promise((resolve, reject) => {
-      const parsedUrl = new URL(url);
-      const transport = parsedUrl.protocol === 'https:' ? https : http;
-
-      const req = transport.request(
-        parsedUrl,
-        { method, headers: requestHeaders },
-        (res) => {
-          let responseBody = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk) => {
-            responseBody += chunk;
-          });
-          res.on('end', () => {
-            const status = res.statusCode || 0;
-            resolve({
-              ok: status >= 200 && status < 300,
-              status,
-              bodyText: responseBody
-            });
-          });
-        }
-      );
-
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(new Error(`Request timeout after ${timeoutMs}ms`));
-      });
-
-      req.on('error', reject);
-
-      if (body) {
-        req.write(body);
-      }
-      req.end();
-    });
-  }
-
-  validateKyberRouter(routerAddress) {
-    const allowedRouters = config.kyber.allowedRouters;
-    if (!allowedRouters.length) return;
-
-    const isAllowed = allowedRouters.some(
-      (allowed) => allowed.toLowerCase() === routerAddress.toLowerCase()
-    );
-
-    if (!isAllowed) {
-      throw new Error(`Kyber returned non-allowlisted router: ${routerAddress}`);
-    }
-  }
-
-  async getKyberRoute(tokenIn, tokenOut, amountIn) {
-    const query = new URLSearchParams({
-      tokenIn,
-      tokenOut,
-      amountIn: amountIn.toString()
-    });
-
-    if (config.kyber.includedSources) {
-      query.set('includedSources', config.kyber.includedSources);
-    }
-
-    const url = `${this.getKyberApiUrl('routes')}?${query.toString()}`;
-    const response = await this.httpRequest(url, {
-      method: 'GET',
-      headers: this.getKyberHeaders()
-    });
-
-    const bodyText = response.bodyText;
-    const payload = this.parseJsonResponse(bodyText, 'Kyber route API');
-
-    if (!response.ok || payload.code !== 0 || !payload.data?.routeSummary || !payload.data?.routerAddress) {
-      throw new Error(`Kyber route request failed (HTTP ${response.status}): ${bodyText}`);
-    }
-
-    return payload.data;
-  }
-
-  async buildKyberRoute(routeSummary, sender, recipient) {
-    const requestBody = {
-      routeSummary,
-      sender,
-      recipient,
-      slippageTolerance: config.slippageBps
-    };
-
-    if (config.kyber.source) {
-      requestBody.source = config.kyber.source;
-    }
-
-    const response = await this.httpRequest(this.getKyberApiUrl('route/build'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...this.getKyberHeaders()
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    const bodyText = response.bodyText;
-    const payload = this.parseJsonResponse(bodyText, 'Kyber build API');
-
-    if (!response.ok || payload.code !== 0 || !payload.data) {
-      throw new Error(`Kyber build request failed (HTTP ${response.status}): ${bodyText}`);
-    }
-
-    const buildData = payload.data;
-    const txData = buildData.data || buildData.encodedSwapData;
-    const txValue = buildData.transactionValue || buildData.value || '0';
-    const routerAddress = buildData.routerAddress;
-
-    if (!txData || !routerAddress) {
-      throw new Error(`Kyber build response missing tx data: ${bodyText}`);
-    }
-
-    return {
-      routerAddress,
-      txData,
-      txValue,
-      amountOut: buildData.amountOut || routeSummary.amountOut
-    };
-  }
-
   /**
-   * Swap tokens using Kyber Aggregator API (quote + build + execute).
+   * Swap tokens via the Aerodrome Universal Router.
+   *
+   * Flow:
+   *   1. Read tickSpacing from pool.
+   *   2. On-chain quote via Aerodrome Quoter → derive amountOutMinimum.
+   *   3. Approve the router's Permit2 contract to spend tokenIn.
+   *   4. Build execute() with command 0x00 (V3/CL exact-in) and
+   *      CL path: tokenIn (20 bytes) + tickSpacing (3 bytes) + tokenOut (20 bytes).
+   *   5. Send via Universal Router.
    */
   async swapTokens(tokenIn, tokenOut, amountIn, poolAddress) {
     if (BigInt(amountIn) === 0n) {
@@ -647,80 +499,132 @@ class Rebalancer {
       return null;
     }
 
-    logger.info(`Swapping ${amountIn} of token ${tokenIn} for ${tokenOut} via Kyber Aggregator...`);
+    logger.info(`Swapping ${amountIn} of token ${tokenIn} for ${tokenOut} via Aerodrome Universal Router...`);
 
     try {
-      const userAddress = this.web3.wallet.address;
       const amountInBigInt = BigInt(amountIn.toString());
-      const runSwapAttempt = async () => {
-        const routeData = await this.getKyberRoute(tokenIn, tokenOut, amountInBigInt);
-        const routeSummary = routeData.routeSummary;
-        logger.info(`Kyber quote amountOut: ${routeSummary.amountOut}`);
-        logger.info(`Kyber suggested router: ${routeData.routerAddress}`);
+      const userAddress    = this.web3.wallet.address;
+      const routerAddress  = config.aerodrome.universalRouter;
 
-        const builtSwap = await this.buildKyberRoute(routeSummary, userAddress, userAddress);
-        logger.info(`Kyber build amountOut: ${builtSwap.amountOut}`);
-        logger.info(`Kyber execution router: ${builtSwap.routerAddress}`);
+      // 1. Read tickSpacing from the pool
+      const poolContract = new Contract(
+        poolAddress,
+        ['function tickSpacing() view returns (int24)'],
+        this.web3.wallet
+      );
+      const tickSpacing = await poolContract.tickSpacing();
 
-        // Defend against unexpected router changes between route and build.
-        if (routeData.routerAddress.toLowerCase() !== builtSwap.routerAddress.toLowerCase()) {
-          throw new Error(`Kyber router mismatch between route and build: ${routeData.routerAddress} != ${builtSwap.routerAddress}`);
-        }
+      // 2. On-chain quote — staticCall on the Aerodrome Quoter
+      //    Struct order: tokenIn, tokenOut, amountIn, tickSpacing, sqrtPriceLimitX96
+      const quoterContract = new Contract(
+        config.aerodrome.quoter,
+        ['function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, int24 tickSpacing, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)'],
+        this.web3.wallet
+      );
+      const quoteResult = await quoterContract.quoteExactInputSingle.staticCall({
+        tokenIn,
+        tokenOut,
+        amountIn:          amountInBigInt,
+        tickSpacing,
+        sqrtPriceLimitX96: 0n,
+      });
 
-        this.validateKyberRouter(builtSwap.routerAddress);
+      const expectedOut      = quoteResult[0];
+      const amountOutMinimum = (expectedOut * BigInt(10000 - config.slippageBps)) / 10000n;
 
-        await this.web3.approveToken(tokenIn, builtSwap.routerAddress, amountInBigInt.toString());
+      logger.info(`Aerodrome quote amountOut: ${expectedOut}`);
+      logger.info(`Aerodrome amountOutMinimum (${config.slippageBps}bps slippage): ${amountOutMinimum}`);
+
+      // 3. Two-step Permit2 approval:
+      //    a) ERC-20: approve Permit2 to spend tokenIn (one-time, max amount)
+      //    b) Permit2: approve the Universal Router to pull tokenIn on our behalf
+      const routerAbiPermit = new Contract(
+        routerAddress,
+        ['function PERMIT2() view returns (address)'],
+        this.web3.wallet
+      );
+      const permit2Address = await routerAbiPermit.PERMIT2();
+
+      // 3a. ERC-20 approval to Permit2
+      await this.web3.approveToken(tokenIn, permit2Address, amountInBigInt.toString());
+
+      // 3b. Permit2 allowance approval to Universal Router (skip if already max)
+      const maxUint160 = (2n ** 160n) - 1n;
+      const maxUint48  = (2n ** 48n)  - 1n;
+      const permit2Contract = new Contract(
+        permit2Address,
+        [
+          'function approve(address token, address spender, uint160 amount, uint48 expiration) external',
+          'function allowance(address user, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)',
+        ],
+        this.web3.wallet
+      );
+      const [p2Amount] = await permit2Contract.allowance(userAddress, tokenIn, routerAddress);
+      if (p2Amount < amountInBigInt) {
+        logger.info(`Setting Permit2 allowance for ${tokenIn} → router...`);
+        const permit2Tx = await permit2Contract.approve(tokenIn, routerAddress, maxUint160, maxUint48);
+        await permit2Tx.wait();
+        logger.info('Permit2 allowance set.');
         await delay(1000);
+      } else {
+        logger.info('Permit2 allowance already sufficient; skipping.');
+      }
 
-        const txRequest = {
-          to: builtSwap.routerAddress,
-          data: builtSwap.txData,
-          value: BigInt(builtSwap.txValue.toString())
-        };
+      // 4. Encode CL path:
+      //    tokenIn (20 bytes) + poolParam (3 bytes) + tokenOut (20 bytes)
+      //
+      // Aerodrome UR expects Slipstream routes to use poolParam = 0x100000 + tickSpacing.
+      // For this bot we route through Slipstream (isUni=false).
+      const slipstreamPoolParam = (0x100000 + Number(tickSpacing)).toString(16).padStart(6, '0');
+      const path = '0x'
+        + tokenIn.slice(2).toLowerCase()
+        + slipstreamPoolParam
+        + tokenOut.slice(2).toLowerCase();
 
-        let receipt;
-        try {
-          receipt = await this.web3.sendTransaction(txRequest);
-        } catch (sendError) {
-          const isNonceExpired =
-            sendError?.code === 'NONCE_EXPIRED' ||
-            /nonce too low|nonce has already been used/i.test(sendError?.message || '');
+      // Input for command 0x00 (V3_SWAP_EXACT_IN — CL pool):
+      //   abi.encode(recipient, amountIn, amountOutMinimum, path, payerIsUser, isUni)
+      //   payerIsUser=true  => pull tokenIn from msg.sender via Permit2
+      //   isUni=false       => Aerodrome Slipstream route format
+      const abiCoder  = new ethers.AbiCoder();
+      const swapInput = abiCoder.encode(
+        ['address', 'uint256', 'uint256', 'bytes', 'bool', 'bool'],
+        [userAddress, amountInBigInt, amountOutMinimum, path, true, false]
+      );
 
-          if (!isNonceExpired) {
-            throw sendError;
-          }
+      // 5. Execute via Universal Router: execute(commands, inputs[], deadline)
+      const universalRouter = new Contract(
+        routerAddress,
+        ['function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable'],
+        this.web3.wallet
+      );
 
-          logger.warn('Nonce expired on Kyber swap submit. Resetting nonce manager and retrying once...');
-          if (typeof this.web3.wallet.reset === 'function') {
-            this.web3.wallet.reset();
-          }
-          receipt = await this.web3.sendTransaction(txRequest);
-        }
-        logger.info(`Kyber swap completed, tx: ${receipt.hash}`);
-        return receipt;
-      };
+      const deadline  = BigInt(Math.floor(Date.now() / 1000) + 300); // 5 min
+      const txRequest = await universalRouter.execute.populateTransaction(
+        '0x00',       // command byte: V3_SWAP_EXACT_IN (CL concentrated liquidity pool)
+        [swapInput],
+        deadline
+      );
 
+      let receipt;
       try {
-        return await runSwapAttempt();
-      } catch (attemptError) {
-        const retryableRouteError =
-          /Call failed|Return amount is not enough|TransferHelper: TRANSFER_FROM_FAILED/i.test(
-            String(attemptError?.message || '')
-          );
+        receipt = await this.web3.sendTransaction(txRequest);
+      } catch (sendError) {
+        const isNonceExpired =
+          sendError?.code === 'NONCE_EXPIRED' ||
+          /nonce too low|nonce has already been used/i.test(sendError?.message || '');
 
-        if (!retryableRouteError) {
-          throw attemptError;
-        }
+        if (!isNonceExpired) throw sendError;
 
-        logger.warn(`Kyber route execution failed (${attemptError.message}). Re-quoting and retrying once...`);
-        await delay(1000);
-        return await runSwapAttempt();
+        logger.warn('Nonce expired on swap submit. Resetting nonce manager and retrying once...');
+        if (typeof this.web3.wallet.reset === 'function') this.web3.wallet.reset();
+        receipt = await this.web3.sendTransaction(txRequest);
       }
+
+      logger.info(`Aerodrome swap completed, tx: ${receipt.hash}`);
+      return receipt;
     } catch (error) {
-      logger.error(`Kyber swap failed: ${error.message}`);
-      if (error.data) {
-        logger.error(`Error data: ${error.data}`);
-      }
+      logger.error(`Aerodrome swap failed: ${error.message}`);
+      if (error.data) logger.error(`Error data: ${error.data}`);
       return null;
     }
   }
